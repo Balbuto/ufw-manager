@@ -51,7 +51,8 @@ sudo ufw enable
 
 ### 1. Клонирование репозитория
 ```bash
-git clone https://github.com/USERNAME/ufw-manager.git
+git clone https://github.com/Balbuto/ufw-manager.git
+cd ufw-manager
 cd ufw-manager
 ```
 
