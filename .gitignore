@@ -1,0 +1,6 @@
+# Ignore config backups
+rules.config.bak
+
+# Ignore system files
+.DS_Store
+*.swp
