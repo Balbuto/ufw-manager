@@ -80,7 +80,10 @@ fail2ban_manage() {
     case $c in
         1)
             echo "🔹 Установка Fail2ban..."
-            apt update && apt install -y fail2ban
+            apt update
+            # Устанавливаем необходимые зависимости для Ubuntu 24+
+            apt install -y python3-apt python3-venv python3-all || true
+            apt install -y fail2ban
             systemctl enable --now fail2ban
             echo "✅ Fail2ban установлен и запущен"
             ;;
