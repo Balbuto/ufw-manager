@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # КОНФИГУРАЦИЯ И КОНСТАНТЫ
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.0.1"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly LOCK_FILE="/var/run/ufw-manager.lock"
 readonly LOG_FILE="/var/log/ufw-manager.log"
@@ -1446,7 +1446,11 @@ fail2ban_menu() {
                 done < <(get_fail2ban_jails)
                 
                 if [[ ${#jails[@]} -gt 0 ]]; then
-                    printf "%d. %s\n" "${!jails[@]}" "${jails[@]}"
+                    local idx=1
+                    for jail in "${jails[@]}"; do
+                        echo "  $idx. $jail"
+                        ((idx++))
+                    done
                 else
                     echo "  Нет активных jails"
                 fi
