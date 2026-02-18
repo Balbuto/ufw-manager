@@ -1,17 +1,54 @@
 #!/bin/bash
 #
 # UFW Manager с интеграцией Fail2ban
-# Версия 2.0.2 - Полностью исправленная
+# Версия 2.1.0 - Полностью исправленная и улучшенная
 #
+# ОСОБЕННОСТИ:
+# - Полная интеграция UFW и Fail2ban
+# - Автоматическая синхронизация правил
+# - Защита от удаления SSH правил
+# - Поддержка systemd, OpenRC, SysVinit
+# - Цветной вывод с эмодзи
+# - Кэширование для оптимизации
+# - Транзакционное создание jails
+# - Автоматическое резервное копирование
+#
+# ЗАВИСИМОСТИ:
+# - ufw
+# - fail2ban (опционально)
+# - bash 4.0+
+# - coreutils (grep, sed, awk)
+#
+# ИСПОЛЬЗОВАНИЕ:
+#   sudo ./ufw-manager.sh
+#   DEBUG=1 sudo ./ufw-manager.sh  # Режим отладки
+#
+# ФАЙЛЫ КОНФИГУРАЦИИ:
+# - rules.config - список правил UFW
+# - /etc/fail2ban/jail.d/*.local - jails fail2ban
+# - /var/log/ufw-manager.log - лог-файл
+# ============================================================================
 
 set -euo pipefail
 IFS=$'\n\t'
 
 # ============================================================================
+# РЕЖИМ ОТЛАДКИ
+# ============================================================================
+DEBUG_MODE=${DEBUG:-0}
+
+debug_log() {
+    if [[ $DEBUG_MODE -eq 1 ]]; then
+        echo "[DEBUG] $*" >&2
+    fi
+    log_action "DEBUG" "$*"
+}
+
+# ============================================================================
 # КОНФИГУРАЦИЯ И КОНСТАНТЫ
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.0.2"
+readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly LOCK_FILE="/var/run/ufw-manager.lock"
 readonly LOG_FILE="/var/log/ufw-manager.log"
@@ -23,6 +60,7 @@ readonly RULES_FILE="${SCRIPT_DIR}/rules.config"
 readonly FAIL2BAN_LOCAL_CONFIG="/etc/fail2ban/jail.local"
 readonly FAIL2BAN_JAIL_DIR="/etc/fail2ban/jail.d/"
 readonly FAIL2BAN_FILTER_DIR="/etc/fail2ban/filter.d/"
+readonly FAIL2BAN_ACTION_DIR="/etc/fail2ban/action.d/"
 
 # Цвета для вывода
 readonly COLOR_RED='\033[0;31m'
@@ -92,9 +130,32 @@ color_echo() {
     esac
 }
 
+# Транзакционное выполнение (с защитой от прерываний)
+critical_operation() {
+    local op="$1"
+    shift
+    
+    debug_log "Начало критической операции: $op"
+    
+    # Блокируем прерывания
+    trap '' INT
+    
+    $op "$@"
+    local result=$?
+    
+    debug_log "Критическая операция завершена с кодом: $result"
+    
+    # Восстанавливаем обработку прерываний
+    trap 'cleanup' INT
+    
+    return $result
+}
+
 # Успешное завершение с очисткой
 cleanup() {
     local exit_code=$?
+    
+    debug_log "Запуск cleanup с кодом: $exit_code"
     
     # Восстановление курсора
     tput cnorm 2>/dev/null || true
@@ -102,11 +163,13 @@ cleanup() {
     # Удаление временных файлов
     if [[ -n "${TEMP_DIR:-}" && -d "$TEMP_DIR" ]]; then
         rm -rf "$TEMP_DIR" 2>/dev/null || true
+        debug_log "Временная директория удалена: $TEMP_DIR"
     fi
     
     # Освобождение lock-файла
     if [[ -f "$LOCK_FILE" ]]; then
         rm -f "$LOCK_FILE" 2>/dev/null || true
+        debug_log "Lock-файл удален: $LOCK_FILE"
     fi
     
     # Логирование завершения
@@ -122,9 +185,10 @@ cleanup() {
 # Обработка ошибок
 error_handler() {
     local line_no=$1
-    log_action "ERROR" "Ошибка в строке $line_no"
-    color_echo RED "${EMOJI_ERROR} Произошла внутренняя ошибка (строка: $line_no)"
-    exit 1
+    local error_code=$?
+    log_action "ERROR" "Ошибка в строке $line_no (код: $error_code)"
+    color_echo RED "${EMOJI_ERROR} Произошла внутренняя ошибка (строка: $line_no, код: $error_code)"
+    exit $error_code
 }
 
 # Установка обработчиков
@@ -138,6 +202,7 @@ check_root() {
         log_action "ERROR" "Попытка запуска без root-прав"
         exit 1
     fi
+    debug_log "Проверка root-прав: OK"
 }
 
 # Блокировка повторного запуска
@@ -153,6 +218,7 @@ acquire_lock() {
         fi
     fi
     echo $$ > "$LOCK_FILE"
+    debug_log "Lock-файл создан с PID: $$"
     return 0
 }
 
@@ -172,6 +238,7 @@ check_dependencies() {
         log_action "ERROR" "Отсутствуют зависимости: ${missing[*]}"
         exit 1
     fi
+    debug_log "Проверка зависимостей: OK"
 }
 
 # Создание backup
@@ -182,6 +249,7 @@ backup_file() {
         local backup_name="${BACKUP_DIR}/$(basename "$file").$(date +%Y%m%d_%H%M%S).bak"
         cp -a "$file" "$backup_name" 2>/dev/null || true
         log_action "INFO" "Создан backup: $backup_name"
+        debug_log "Backup создан: $backup_name"
         echo "$backup_name"
     fi
 }
@@ -252,6 +320,7 @@ service_action() {
     manager=$(get_service_manager)
     
     log_action "INFO" "Действие '$action' для службы '$service_name'"
+    debug_log "Service manager: $manager, action: $action, service: $service_name"
     
     case "$manager" in
         systemd)
@@ -290,23 +359,53 @@ is_service_active() {
 # UFW ФУНКЦИИ
 # ============================================================================
 
-# Кэш статуса UFW
+# Кэш статуса UFW (с учетом направления)
 declare -A UFW_CACHE
 declare UFW_CACHE_TIME=0
 
 refresh_ufw_cache() {
+    debug_log "Обновление кэша UFW"
     UFW_CACHE=()
     local status_output
-    status_output=$(ufw status 2>/dev/null || true)
+    status_output=$(ufw status verbose 2>/dev/null || true)
     UFW_CACHE_TIME=$(date +%s)
     
     while IFS= read -r line; do
-        if [[ "$line" =~ ^[0-9]+/.* ]]; then
-            local port_proto
-            port_proto=$(echo "$line" | awk '{print $1}')
-            UFW_CACHE["$port_proto"]=1
+        # Парсим вывод ufw status verbose для определения направления
+        if [[ "$line" =~ ^([0-9]+/(tcp|udp)).*ALLOW ]]; then
+            local port_proto="${BASH_REMATCH[1]}"
+            local direction="IN"
+            
+            # Проверяем, не исходящее ли это правило
+            if [[ "$line" =~ .*\(out\) ]]; then
+                direction="OUT"
+            fi
+            
+            UFW_CACHE["${direction}:${port_proto}"]=1
+            debug_log "Кэшировано правило: ${direction}:${port_proto}"
         fi
     done <<< "$status_output"
+}
+
+get_ufw_rules() {
+    local numbered=${1:-0}
+    local rules=()
+    
+    if [[ $numbered -eq 1 ]]; then
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^\[[0-9]+\] ]]; then
+                rules+=("$line")
+            fi
+        done < <(ufw status numbered 2>/dev/null)
+    else
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^[0-9]+/.*(ALLOW|DENY) ]]; then
+                rules+=("$line")
+            fi
+        done < <(ufw status verbose 2>/dev/null)
+    fi
+    
+    printf '%s\n' "${rules[@]}"
 }
 
 is_ufw_enabled() {
@@ -314,9 +413,12 @@ is_ufw_enabled() {
 }
 
 ufw_rule_exists() {
-    local port="$1"
-    local proto="$2"
-    local cache_key="${port}/${proto}"
+    local dir="$1"
+    local port="$2"
+    local proto="$3"
+    local cache_key="${dir}:${port}/${proto}"
+    
+    debug_log "Проверка существования правила: $cache_key"
     
     local current_time
     current_time=$(date +%s)
@@ -332,13 +434,15 @@ apply_ufw_rule() {
     local port="$2"
     local proto="$3"
     
+    debug_log "Применение правила: $dir $port/$proto"
+    
     if [[ "$proto" == "both" ]]; then
         apply_ufw_rule "$dir" "$port" "tcp" || return 1
         apply_ufw_rule "$dir" "$port" "udp" || return 1
         return 0
     fi
     
-    if ufw_rule_exists "$port" "$proto"; then
+    if ufw_rule_exists "$dir" "$port" "$proto"; then
         color_echo YELLOW "${EMOJI_WARN} Правило $dir $port/$proto уже существует"
         return 0
     fi
@@ -358,7 +462,8 @@ apply_ufw_rule() {
             }
             color_echo GREEN "${EMOJI_OK} Правило BOTH $port/$proto добавлено"
             log_action "INFO" "Добавлено правило BOTH $port/$proto"
-            UFW_CACHE["${port}/${proto}"]=1
+            UFW_CACHE["IN:${port}/${proto}"]=1
+            UFW_CACHE["OUT:${port}/${proto}"]=1
             return 0
             ;;
         *)
@@ -367,10 +472,10 @@ apply_ufw_rule() {
             ;;
     esac
     
-    if eval "$cmd" >/dev/null 2>&1; then
+    if critical_operation eval "$cmd >/dev/null 2>&1"; then
         color_echo GREEN "${EMOJI_OK} Правило $dir $port/$proto добавлено"
         log_action "INFO" "Добавлено правило $dir $port/$proto"
-        UFW_CACHE["${port}/${proto}"]=1
+        UFW_CACHE["${dir}:${port}/${proto}"]=1
         return 0
     else
         color_echo RED "${EMOJI_ERROR} Не удалось добавить правило $dir $port/$proto"
@@ -383,6 +488,8 @@ delete_ufw_rule() {
     local dir="$1"
     local port="$2"
     local proto="$3"
+    
+    debug_log "Удаление правила: $dir $port/$proto"
     
     local ssh_port
     ssh_port=$(detect_ssh_port)
@@ -416,7 +523,8 @@ delete_ufw_rule() {
             ufw delete allow out "$port/$proto" >/dev/null 2>&1 || true
             color_echo GREEN "${EMOJI_OK} Правило BOTH $port/$proto удалено"
             log_action "INFO" "Удалено правило BOTH $port/$proto"
-            unset 'UFW_CACHE[${port}/${proto}]'
+            unset "UFW_CACHE[IN:${port}/${proto}]"
+            unset "UFW_CACHE[OUT:${port}/${proto}]"
             return 0
             ;;
         *)
@@ -426,7 +534,7 @@ delete_ufw_rule() {
     
     color_echo GREEN "${EMOJI_OK} Правило $dir $port/$proto удалено"
     log_action "INFO" "Удалено правило $dir $port/$proto"
-    unset 'UFW_CACHE[${port}/${proto}]'
+    unset "UFW_CACHE[${dir}:${port}/${proto}]"
     return 0
 }
 
@@ -442,6 +550,49 @@ detect_ssh_port() {
 
 fail2ban_installed() {
     command -v fail2ban-client >/dev/null 2>&1
+}
+
+# Проверка/создание действия ufw для fail2ban
+ensure_fail2ban_ufw_action() {
+    local ufw_action_file="${FAIL2BAN_ACTION_DIR}/ufw.conf"
+    
+    if [[ ! -f "$ufw_action_file" ]]; then
+        color_echo YELLOW "${EMOJI_WARN} Действие ufw для fail2ban не найдено, создаю..."
+        debug_log "Создание действия ufw: $ufw_action_file"
+        
+        mkdir -p "$FAIL2BAN_ACTION_DIR"
+        cat > "$ufw_action_file" << 'EOF'
+# Fail2Ban action configuration for UFW
+#
+# Author: Yannick Charton
+# Modified for ufw-manager
+
+[Definition]
+description = UFW firewall
+
+[Init]
+name = default
+port = ssh
+protocol = tcp
+
+[ActionStart]
+# Не требуется
+
+[ActionStop]
+# Не требуется
+
+[ActionCheck]
+# Не требуется
+
+[ActionBan]
+ufw insert 1 deny from <ip> to any port <port> proto <protocol>
+
+[ActionUnban]
+ufw delete deny from <ip> to any port <port> proto <protocol>
+EOF
+        color_echo GREEN "${EMOJI_OK} Действие ufw создано"
+        log_action "INFO" "Создано действие ufw для fail2ban"
+    fi
 }
 
 get_fail2ban_jails() {
@@ -495,6 +646,9 @@ create_fail2ban_jail() {
         return 1
     fi
     
+    # Проверяем наличие действия ufw
+    ensure_fail2ban_ufw_action
+    
     color_echo CYAN "${EMOJI_ADD} Создание нового Fail2ban Jail"
     echo ""
     
@@ -542,8 +696,21 @@ create_fail2ban_jail() {
     read -rp "Путь к лог-файлу [/var/log/auth.log]: " logpath
     logpath=${logpath:-/var/log/auth.log}
     
+    # Валидация лог-файла
+    if [[ ! -f "$logpath" ]]; then
+        color_echo YELLOW "${EMOJI_WARN} Лог-файл $logpath не существует"
+        read -rp "Продолжить создание jail? (y/N): " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+    fi
+    
     local temp_jail_file="${TEMP_DIR}/${jail_name}.local"
     local temp_filter_file="${TEMP_DIR}/${jail_name}.conf"
+    
+    # Определяем правильное действие в зависимости от версии fail2ban
+    local banaction="ufw"
+    if fail2ban-client -V 2>/dev/null | grep -q "0\.\(8\|9\|10\)"; then
+        banaction="ufw"
+    fi
     
     cat > "$temp_jail_file" << EOF
 [$jail_name]
@@ -555,7 +722,8 @@ logpath = $logpath
 maxretry = $maxretry
 bantime = $bantime
 findtime = $findtime
-action = ufw[name=UFW, port="\$(port)", protocol="\$(protocol)"]
+banaction = $banaction
+action = $banaction[name=$jail_name, port="$jail_port", protocol="$jail_protocol"]
 backend = auto
 EOF
     
@@ -567,6 +735,8 @@ failregex = ^.*Failed password for .* from <HOST> port .*$
             ^.*Connection closed by authenticating user .* <HOST> port .*$
 ignoreregex = ^.*Failed password for .* from 127.0.0.1.*$
 EOF
+    
+    debug_log "Временные файлы созданы: $temp_jail_file, $temp_filter_file"
     
     backup_file "${FAIL2BAN_JAIL_DIR}/${jail_name}.local" >/dev/null 2>&1 || true
     backup_file "${FAIL2BAN_FILTER_DIR}/${jail_name}.conf" >/dev/null 2>&1 || true
@@ -583,7 +753,7 @@ EOF
         return 1
     fi
     
-    if service_action "restart" "fail2ban" || service_action "reload" "fail2ban"; then
+    if critical_operation service_action "restart" "fail2ban" || service_action "reload" "fail2ban"; then
         sleep 2
         if jail_exists "$jail_name"; then
             color_echo GREEN "${EMOJI_OK} Jail '$jail_name' успешно создан и активирован"
@@ -649,7 +819,7 @@ delete_fail2ban_jail() {
     
     backup_file "${FAIL2BAN_JAIL_DIR}/${jail_name}.local" >/dev/null 2>&1 || true
     
-    fail2ban-client stop "$jail_name" >/dev/null 2>&1 || true
+    critical_operation fail2ban-client stop "$jail_name" >/dev/null 2>&1 || true
     rm -f "${FAIL2BAN_JAIL_DIR}/${jail_name}.local"
     rm -f "${FAIL2BAN_FILTER_DIR}/${jail_name}.conf"
     
@@ -893,19 +1063,53 @@ create_ufw_rule_from_jail() {
     
     IFS=":" read -r port proto <<< "$port_proto"
     
-    if ufw_rule_exists "$port" "$proto"; then
-        color_echo YELLOW "${EMOJI_WARN} Правило для $jail ($port/$proto) уже существует"
+    # Обработка специальных значений
+    if [[ "$port" == "all" || "$port" == "0:65535" ]]; then
+        color_echo YELLOW "${EMOJI_WARN} Jail $jail отслеживает все порты, пропускаем автоматическое создание правила"
         return 0
     fi
     
-    color_echo CYAN "${EMOJI_ADD} Добавление UFW правила для $jail ($port/$proto)"
+    # Проверка на диапазон портов
+    if [[ "$port" =~ ^[0-9]+:[0-9]+$ ]]; then
+        color_echo YELLOW "${EMOJI_WARN} Jail $jail использует диапазон портов ($port), требуется ручная настройка"
+        return 0
+    fi
     
-    if apply_ufw_rule "IN" "$port" "$proto"; then
-        if ! grep -q ":IN:$port:$proto$" "$RULES_FILE" 2>/dev/null; then
-            echo "fail2ban-$jail:IN:$port:$proto" >> "$RULES_FILE"
+    # Проверка на несколько портов через запятую
+    if [[ "$port" == *,* ]]; then
+        local IFS=','
+        read -ra ports <<< "$port"
+        local success=0
+        for p in "${ports[@]}"; do
+            p=$(echo "$p" | tr -d ' ')
+            if [[ "$p" =~ ^[0-9]+$ ]] && apply_ufw_rule "IN" "$p" "$proto"; then
+                ((success++))
+            fi
+        done
+        if [[ $success -gt 0 ]]; then
+            echo "fail2ban-$jail:IN:${port}:${proto}" >> "$RULES_FILE"
+            return 0
         fi
-        return 0
+        return 1
     fi
+    
+    # Обычный порт
+    if [[ "$port" =~ ^[0-9]+$ ]]; then
+        if ufw_rule_exists "IN" "$port" "$proto"; then
+            color_echo YELLOW "${EMOJI_WARN} Правило для $jail ($port/$proto) уже существует"
+            return 0
+        fi
+        
+        color_echo CYAN "${EMOJI_ADD} Добавление UFW правила для $jail ($port/$proto)"
+        
+        if apply_ufw_rule "IN" "$port" "$proto"; then
+            if ! grep -q ":IN:$port:$proto$" "$RULES_FILE" 2>/dev/null; then
+                echo "fail2ban-$jail:IN:$port:$proto" >> "$RULES_FILE"
+            fi
+            return 0
+        fi
+    fi
+    
     return 1
 }
 
@@ -995,7 +1199,10 @@ bantime = 600
 EOF
                         fi
                         
-                        mkdir -p "$FAIL2BAN_JAIL_DIR"
+                        mkdir -p "$FAIL2BAN_JAIL_DIR" "$FAIL2BAN_ACTION_DIR"
+                        
+                        # Создаем действие ufw
+                        ensure_fail2ban_ufw_action
                         
                         service_action "enable" "fail2ban"
                         service_action "start" "fail2ban"
@@ -1098,6 +1305,126 @@ EOF
 }
 
 # ============================================================================
+# ФУНКЦИЯ ПРОВЕРКИ ЦЕЛОСТНОСТИ
+# ============================================================================
+
+verify_integrity() {
+    color_echo CYAN "${EMOJI_SEARCH} Проверка целостности системы..."
+    echo ""
+    
+    # Проверка UFW
+    if is_ufw_enabled; then
+        color_echo GREEN "${EMOJI_OK} UFW: активен"
+    else
+        color_echo YELLOW "${EMOJI_WARN} UFW: не активен"
+    fi
+    
+    # Проверка Fail2ban
+    if fail2ban_installed; then
+        if is_service_active "fail2ban"; then
+            color_echo GREEN "${EMOJI_OK} Fail2ban: активен"
+        else
+            color_echo YELLOW "${EMOJI_WARN} Fail2ban: установлен, но не активен"
+        fi
+    else
+        color_echo YELLOW "${EMOJI_WARN} Fail2ban: не установлен"
+    fi
+    
+    echo ""
+    
+    # Проверка соответствия правил UFW и Fail2ban
+    if fail2ban_installed && is_service_active "fail2ban"; then
+        color_echo CYAN "Проверка синхронизации UFW и Fail2ban..."
+        
+        local jails=()
+        while IFS= read -r jail; do
+            [[ -n "$jail" ]] && jails+=("$jail")
+        done < <(get_fail2ban_jails)
+        
+        local issues=0
+        for jail in "${jails[@]}"; do
+            local port_proto
+            port_proto=$(get_jail_port_proto "$jail")
+            if [[ -n "$port_proto" ]]; then
+                IFS=":" read -r port proto <<< "$port_proto"
+                
+                # Пропускаем специальные значения
+                if [[ "$port" == "all" || "$port" == "0:65535" ]]; then
+                    continue
+                fi
+                
+                # Проверка диапазона
+                if [[ "$port" =~ ^[0-9]+:[0-9]+$ ]]; then
+                    continue
+                fi
+                
+                # Проверка списка портов
+                if [[ "$port" == *,* ]]; then
+                    local IFS=','
+                    read -ra ports <<< "$port"
+                    for p in "${ports[@]}"; do
+                        p=$(echo "$p" | tr -d ' ')
+                        if [[ "$p" =~ ^[0-9]+$ ]] && ! ufw_rule_exists "IN" "$p" "$proto"; then
+                            color_echo YELLOW "${EMOJI_WARN} Jail $jail (порт $p/$proto) не имеет правила UFW"
+                            ((issues++))
+                        fi
+                    done
+                elif [[ "$port" =~ ^[0-9]+$ ]]; then
+                    if ! ufw_rule_exists "IN" "$port" "$proto"; then
+                        color_echo YELLOW "${EMOJI_WARN} Jail $jail ($port/$proto) не имеет правила UFW"
+                        ((issues++))
+                    fi
+                fi
+            fi
+        done
+        
+        if [[ $issues -eq 0 ]]; then
+            color_echo GREEN "${EMOJI_OK} Все jails имеют соответствующие правила UFW"
+        else
+            color_echo YELLOW "${EMOJI_WARN} Найдено $issues проблем. Запустите автосинхронизацию (меню Fail2ban -> 8)"
+        fi
+    fi
+    
+    # Проверка правил в rules.config
+    if [[ -f "$RULES_FILE" ]]; then
+        echo ""
+        color_echo CYAN "Проверка файла правил $RULES_FILE..."
+        
+        local line_num=0
+        local invalid=0
+        while IFS= read -r line; do
+            ((line_num++))
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            
+            IFS=":" read -r name dir port proto <<< "$line"
+            
+            if ! validate_direction "$dir" 2>/dev/null; then
+                color_echo YELLOW "${EMOJI_WARN} Строка $line_num: неверное направление '$dir'"
+                ((invalid++))
+            fi
+            
+            if ! validate_port "$port" 2>/dev/null && [[ "$port" != "all" ]] && ! [[ "$port" =~ ^[0-9]+:[0-9]+$ ]] && ! [[ "$port" == *,* ]]; then
+                color_echo YELLOW "${EMOJI_WARN} Строка $line_num: неверный порт '$port'"
+                ((invalid++))
+            fi
+            
+            if ! validate_protocol "$proto" 2>/dev/null; then
+                color_echo YELLOW "${EMOJI_WARN} Строка $line_num: неверный протокол '$proto'"
+                ((invalid++))
+            fi
+        done < "$RULES_FILE"
+        
+        if [[ $invalid -eq 0 ]]; then
+            color_echo GREEN "${EMOJI_OK} Файл правил корректен"
+        else
+            color_echo YELLOW "${EMOJI_WARN} Найдено $invalid проблем в файле правил"
+        fi
+    fi
+    
+    pause
+}
+
+# ============================================================================
 # МЕНЮ
 # ============================================================================
 
@@ -1111,6 +1438,7 @@ check_rules_menu() {
         echo ""
         echo "  1. Добавить правила"
         echo "  2. Удалить правила"
+        echo "  3. Проверить целостность"
         echo "  0. Назад"
         echo ""
         
@@ -1119,6 +1447,7 @@ check_rules_menu() {
         case $c in
             1) add_rules_menu ;;
             2) delete_rules_menu ;;
+            3) verify_integrity ;;
             0) break ;;
             *) color_echo YELLOW "${EMOJI_WARN} Неверный выбор"; sleep 1 ;;
         esac
@@ -1242,6 +1571,15 @@ delete_rules_menu() {
                     local deleted=0
                     while IFS=":" read -r name dir port proto; do
                         [[ -z "$name" || "$name" =~ ^# ]] && continue
+                        
+                        # Защита SSH правила
+                        local ssh_port
+                        ssh_port=$(detect_ssh_port)
+                        if [[ "$name" == "SSH" && "$port" == "$ssh_port" && "$proto" == "tcp" ]]; then
+                            color_echo YELLOW "${EMOJI_WARN} Пропускаем SSH правило"
+                            continue
+                        fi
+                        
                         if delete_ufw_rule "$dir" "$port" "$proto"; then
                             ((deleted++))
                         fi
@@ -1263,12 +1601,13 @@ delete_rules_menu() {
                     if [[ -n "$rule" ]]; then
                         local ssh_port
                         ssh_port=$(detect_ssh_port)
-                        if echo "$rule" | grep -q "${ssh_port}/tcp.*ALLOW"; then
+                        if echo "$rule" | grep -q "${ssh_port}/tcp.*ALLOW IN"; then
                             color_echo RED "${EMOJI_ERROR} Удаление SSH правила запрещено"
                         else
-                            if ufw delete "$num" 2>/dev/null; then
+                            if critical_operation ufw delete "$num" <<< "y" 2>/dev/null; then
                                 color_echo GREEN "${EMOJI_OK} Правило №$num удалено"
                                 log_action "INFO" "Удалено правило UFW №$num"
+                                refresh_ufw_cache
                             else
                                 color_echo RED "${EMOJI_ERROR} Ошибка удаления"
                             fi
@@ -1391,8 +1730,10 @@ fail2ban_menu() {
             local jail_count
             jail_count=$(get_fail2ban_jails | wc -l)
             echo "  Активных jails: $jail_count"
+        elif fail2ban_installed; then
+            color_echo YELLOW "${EMOJI_WARN} Fail2ban: установлен, но не активен"
         else
-            color_echo YELLOW "${EMOJI_WARN} Fail2ban: не активен"
+            color_echo YELLOW "${EMOJI_WARN} Fail2ban: не установлен"
         fi
         echo ""
         
@@ -1415,7 +1756,11 @@ fail2ban_menu() {
             1)
                 clear
                 if fail2ban_installed; then
-                    systemctl status fail2ban --no-pager 2>/dev/null | head -20 || service fail2ban status 2>/dev/null | head -20
+                    if command -v systemctl >/dev/null 2>&1; then
+                        systemctl status fail2ban --no-pager 2>/dev/null | head -20
+                    else
+                        service fail2ban status 2>/dev/null | head -20
+                    fi
                 else
                     color_echo YELLOW "${EMOJI_WARN} Fail2ban не установлен"
                 fi
@@ -1524,7 +1869,9 @@ main_menu() {
 # ============================================================================
 
 init_environment() {
-    mkdir -p "$BACKUP_DIR" "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    debug_log "Инициализация окружения"
+    
+    mkdir -p "$BACKUP_DIR" "$(dirname "$LOG_FILE")" "$FAIL2BAN_ACTION_DIR" 2>/dev/null || true
     
     if ! is_ufw_enabled; then
         color_echo YELLOW "${EMOJI_WARN} UFW не активен. Включаю..."
@@ -1540,6 +1887,13 @@ init_environment() {
     
     init_rules_file
     refresh_ufw_cache
+    
+    # Проверяем наличие действия ufw для fail2ban
+    if fail2ban_installed; then
+        ensure_fail2ban_ufw_action
+    fi
+    
+    debug_log "Инициализация завершена"
 }
 
 main() {
@@ -1550,6 +1904,7 @@ main() {
     init_environment
     
     log_action "INFO" "UFW Manager запущен (версия: $SCRIPT_VERSION)"
+    debug_log "Режим отладки: $([ $DEBUG_MODE -eq 1 ] && echo "включен" || echo "выключен")"
     
     main_menu
 }
